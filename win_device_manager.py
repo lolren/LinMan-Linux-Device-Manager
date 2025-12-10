@@ -6,8 +6,8 @@ Dependencies:
     pip install PySide6 pyudev
 
 Features:
+- FIX: Deep Parent Search (Fixes USB Audio/Net devices appearing as generic USB)
 - "Show Hidden Devices" toggle (Hides tty/lo/loops by default)
-- Smart Logic: Hides legacy COM ports, shows active USB COM ports
 - Uses system commands (lspci, lsusb) for name resolution
 - No external database downloads required
 - Root Actions (Unbind, Modprobe) via pkexec
@@ -33,27 +33,15 @@ import pyudev
 
 # --- Backend: Native System Resolver ---
 class SystemResolver:
-    """
-    Resolves names using standard Linux commands (lspci, lsusb)
-    instead of requiring python libraries or raw DB files.
-    """
     def __init__(self):
-        # Check available tools
         self.has_lspci = shutil.which('lspci') is not None
-        self.has_lsusb = shutil.which('lsusb') is not None
         self.pci_cache = {}
 
     def get_pci_name(self, pci_slot_name):
-        """Runs lspci to get the pretty name for a specific slot"""
-        if not self.has_lspci or not pci_slot_name:
-            return None, None
-
-        # Cache check
-        if pci_slot_name in self.pci_cache:
-            return self.pci_cache[pci_slot_name]
+        if not self.has_lspci or not pci_slot_name: return None, None
+        if pci_slot_name in self.pci_cache: return self.pci_cache[pci_slot_name]
 
         try:
-            # -vmm gives machine readable output, -s selects slot
             output = subprocess.check_output(
                 ['lspci', '-s', pci_slot_name, '-vmm'],
                 stderr=subprocess.DEVNULL
@@ -61,34 +49,20 @@ class SystemResolver:
 
             vendor = None
             device = None
-
             for line in output.splitlines():
-                if line.startswith('Vendor:'):
-                    vendor = line.split(':', 1)[1].strip()
-                elif line.startswith('Device:'):
-                    device = line.split(':', 1)[1].strip()
+                if line.startswith('Vendor:'): vendor = line.split(':', 1)[1].strip()
+                elif line.startswith('Device:'): device = line.split(':', 1)[1].strip()
 
             self.pci_cache[pci_slot_name] = (vendor, device)
             return vendor, device
-        except:
-            return None, None
-
-    def clean_name(self, text):
-        if not text: return ""
-        # Remove hex codes like [8086]
-        return re.sub(r'\[[0-9a-fA-F:]{4,}\]', '', text).strip()
+        except: return None, None
 
 # --- Helper: Icon Factory ---
 class IconFactory:
-    """Robust icon loader that falls back to embedded Qt icons"""
     @staticmethod
     def get(name_list, fallback_style_standard):
-        # 1. Try System Theme (Linux native)
         for name in name_list:
-            if QIcon.hasThemeIcon(name):
-                return QIcon.fromTheme(name)
-
-        # 2. Fallback to Qt Internal (Guaranteed to exist)
+            if QIcon.hasThemeIcon(name): return QIcon.fromTheme(name)
         return QApplication.style().standardIcon(fallback_style_standard)
 
     @staticmethod
@@ -117,7 +91,6 @@ class PropertiesDialog(QDialog):
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
 
-        # Header
         header_layout = QHBoxLayout()
         icon_label = QLabel()
         icon_label.setPixmap(self.icon.pixmap(64, 64))
@@ -130,14 +103,12 @@ class PropertiesDialog(QDialog):
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
-        # Tabs
         self.tabs = QTabWidget()
         self.tabs.addTab(self.create_general_tab(), "General")
         self.tabs.addTab(self.create_driver_tab(), "Driver")
         self.tabs.addTab(self.create_details_tab(), "Details")
         layout.addWidget(self.tabs)
 
-        # Buttons
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -366,24 +337,19 @@ class MainWindow(QMainWindow):
         self.refresh_devices()
 
     def is_device_hidden(self, device, category):
-        """
-        Determines default visibility.
-        Returns True if device should be hidden unless 'Show Hidden' is checked.
-        """
         name = device.sys_name
 
-        # 1. HIDE ALL TTYs/COMs by default, EXCEPT USB/ACM (Arduinos, etc)
+        # 1. HIDE ALL TTYs by default, EXCEPT USB/ACM
         if category == 'Ports (COM & LPT)':
-            if name.startswith(('ttyUSB', 'ttyACM')):
-                return False
-            return True # Hides ttyS*, tty1-63, etc.
+            if name.startswith(('ttyUSB', 'ttyACM')): return False
+            return True
 
-        # 2. Hide Loopback/Virtual Network adapters
+        # 2. Hide Loopback/Virtual Net
         if category == 'Network adapters':
             if name == 'lo': return True
             if any(x in name for x in ['virbr', 'docker', 'veth', 'tun', 'tap']): return True
 
-        # 3. Hide Virtual Disks (Loop, Ram)
+        # 3. Hide Virtual Disks
         if category == 'Disk drives':
             if name.startswith(('loop', 'ram', 'dm-')): return True
 
@@ -433,12 +399,16 @@ class MainWindow(QMainWindow):
         for device in self.context.list_devices(subsystem='net'):
             self.handle_child(unique_devices, device, 'Network adapters')
 
-        # Sound
+        # Sound - RECURSIVE PARENT SEARCH FIX for USB Headsets
         for device in self.context.list_devices(subsystem='sound'):
             if 'card' in device.sys_name:
-                parent = device.parent
-                if parent and parent.device_path in unique_devices:
-                    unique_devices[parent.device_path]['category'] = 'Sound, video and game controllers'
+                curr = device
+                # Walk up tree to find physical parent (fixes USB Interface issue)
+                while curr.parent:
+                    curr = curr.parent
+                    if curr.device_path in unique_devices:
+                        unique_devices[curr.device_path]['category'] = 'Sound, video and game controllers'
+                        break
 
         # Disk
         for device in self.context.list_devices(subsystem='block'):
@@ -501,12 +471,20 @@ class MainWindow(QMainWindow):
     def handle_child(self, db, device, category, force_new=False, fmt="{}"):
         hidden = self.is_device_hidden(device, category)
         if not force_new:
-            parent = device.parent
-            if parent and parent.device_path in db:
-                db[parent.device_path]['category'] = category
-                if not db[parent.device_path]['driver']:
-                    db[parent.device_path]['driver'] = device.properties.get('DRIVER', '')
-                return
+            # Recursive check up to 3 levels to find physical parent
+            curr = device
+            found_parent = False
+            for _ in range(3):
+                parent = curr.parent
+                if parent and parent.device_path in db:
+                    db[parent.device_path]['category'] = category
+                    if not db[parent.device_path]['driver']:
+                        db[parent.device_path]['driver'] = device.properties.get('DRIVER', '')
+                    found_parent = True
+                    break
+                if parent: curr = parent
+                else: break
+            if found_parent: return
 
         name = device.properties.get('ID_MODEL', device.sys_name).replace('_', ' ')
         if fmt != "{}": name = fmt.format(device.sys_name)
