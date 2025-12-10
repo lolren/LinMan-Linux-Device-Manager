@@ -10,7 +10,6 @@ Features:
 - Root Actions (Unbind, Modprobe, etc.)
 - Windows 11-style Dark Theme with scaled UI
 
-Author: Claude AI Assistant
 """
 
 import sys
