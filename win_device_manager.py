@@ -1,18 +1,16 @@
 """
-LinMan - Linux Device Manager (Deep Inspection Edition)
-A standalone device manager for hardware diagnostics.
+LinMan - Linux Device Manager (Complete Edition)
+A native, standalone device manager for hardware diagnostics.
 
 Dependencies:
     pip install PySide6 pyudev
 
 Features:
-- Monitors: Native EDID parsing (reads /sys/class/drm/.../edid) for real model names
-- RAM: Reads individual sticks via DMI (requires root/pkexec)
-- Webcams: Uses V4L product names
-- Native Look & Feel
-- "Yellow Bang" (!) Icon logic
-- Root Actions via pkexec
-
+- Privilege Levels: Starts as User. Switch to Root via toolbar.
+- Stability: Uses Handshake logic to ensure smooth User -> Root transition.
+- Monitors: Native EDID parsing for real model names.
+- RAM: DMI decoding (Root only).
+- Interface: Windows Device Manager look & feel.
 """
 
 import sys
@@ -21,26 +19,29 @@ import os
 import re
 import subprocess
 import shutil
-import struct
+import tempfile
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,
                                QMessageBox, QVBoxLayout, QWidget, QDialog, QLabel,
                                QFormLayout, QToolBar, QStyle, QTabWidget, QGroupBox,
-                               QLineEdit, QTextEdit, QFrame, QStyleFactory, QMenu,
+                               QLineEdit, QTextEdit, QFrame, QMenu,
                                QDialogButtonBox, QHBoxLayout, QPushButton, QComboBox,
-                               QHeaderView)
+                               QSizePolicy)
 from PySide6.QtCore import Qt, QSize, QSocketNotifier, Slot, QTimer
-from PySide6.QtGui import QIcon, QAction, QFont, QPalette, QColor, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QAction, QFont, QPainter, QPixmap
 
 import pyudev
 
 # --- CONFIGURATION ---
 GITHUB_URL = "https://github.com/lolren/LinMan-Linux-Device-Manager"
-VERSION = "1.2.0"
+VERSION = "1.3.6"
+HANDSHAKE_FILE = os.path.join(tempfile.gettempdir(), "linman_root_active.lock")
 
 # --- Backend: EDID Parser (Monitors) ---
 class EdidParser:
     @staticmethod
     def get_monitor_name(sys_path):
+        """Reads binary EDID data from sysfs to get the real monitor model name."""
         edid_path = os.path.join(sys_path, "edid")
         if not os.path.exists(edid_path): return None
 
@@ -51,11 +52,9 @@ class EdidParser:
             if len(edid) < 128: return None
 
             # Walk through the 4 descriptors in the EDID block
-            # Descriptors start at byte 54, 72, 90, 108
             for i in [54, 72, 90, 108]:
-                # Monitor Name tag is 0xFC, header is 00 00 00 FC 00
+                # Monitor Name tag is 0xFC
                 if edid[i:i+4] == b'\x00\x00\x00\xfc':
-                    # Text usually ends with \n (0x0a)
                     text = edid[i+5:i+18].decode('cp437', 'ignore').split('\x0a')[0]
                     return text.strip()
         except: pass
@@ -63,16 +62,18 @@ class EdidParser:
 
 # --- Backend: DMI Parser (RAM) ---
 class DmiParser:
+    """
+    Handles 'dmidecode' to read RAM stick info.
+    Strictly checks for root.
+    """
     @staticmethod
     def get_ram_modules():
-        """Runs dmidecode to get RAM info. Requires Root."""
+        if os.geteuid() != 0:
+            return []
+
         modules = []
         try:
-            # Try running without pkexec first (in case we are already root)
             cmd = ['dmidecode', '-t', '17']
-            if os.geteuid() != 0:
-                cmd = ['pkexec'] + cmd
-
             output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8')
 
             current_stick = {}
@@ -94,15 +95,14 @@ class DmiParser:
                     elif k == "Locator": current_stick['Slot'] = v
 
             if current_stick: modules.append(current_stick)
-
         except:
-            # Fallback if user denies root or tool missing
             pass
 
         return modules
 
 # --- Backend: Native System Resolver ---
 class SystemResolver:
+    """Resolves PCI IDs to human readable names using lspci."""
     def __init__(self):
         self.has_lspci = shutil.which('lspci') is not None
         self.pci_cache = {}
@@ -129,6 +129,7 @@ class SystemResolver:
 
 # --- Helper: Icon Factory ---
 class IconFactory:
+    """Handles loading icons from the Linux theme or internal fallbacks."""
     @staticmethod
     def get(name_list, fallback_style_standard):
         for name in name_list:
@@ -137,6 +138,7 @@ class IconFactory:
 
     @staticmethod
     def apply_overlay(base_icon, mode='normal'):
+        """Adds Ghost (transparent) or Warning (Yellow !) overlays."""
         pixmap = base_icon.pixmap(32, 32)
         target = QPixmap(pixmap.size())
         target.fill(Qt.transparent)
@@ -150,6 +152,7 @@ class IconFactory:
             painter.drawPixmap(0, 0, pixmap)
 
         if mode == 'warning':
+            # Draw yellow bang in bottom right
             warn_icon = QApplication.style().standardIcon(QStyle.SP_MessageBoxWarning).pixmap(16, 16)
             painter.drawPixmap(16, 16, warn_icon)
 
@@ -171,6 +174,7 @@ class PropertiesDialog(QDialog):
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
 
+        # Header with Icon and Big Name
         header_layout = QHBoxLayout()
         icon_label = QLabel()
         icon_label.setPixmap(self.icon.pixmap(64, 64))
@@ -183,12 +187,14 @@ class PropertiesDialog(QDialog):
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
+        # Tabs
         self.tabs = QTabWidget()
         self.tabs.addTab(self.create_general_tab(), "General")
         self.tabs.addTab(self.create_driver_tab(), "Driver")
         self.tabs.addTab(self.create_details_tab(), "Details")
         layout.addWidget(self.tabs)
 
+        # Close Button
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -215,6 +221,7 @@ class PropertiesDialog(QDialog):
         driver = self.device_data.get('DRIVER')
         is_hidden = self.device_data.get('IS_HIDDEN', False)
         is_physical = self.device_data.get('IS_PHYSICAL', True)
+        category = self.device_data.get('CATEGORY', '')
 
         msg = []
 
@@ -228,8 +235,13 @@ class PropertiesDialog(QDialog):
             msg.append("This device is working properly.")
             msg.append(f"Driver loaded: {driver}")
         elif is_physical and not driver:
-            msg.append("The drivers for this device are not installed. (Code 28)")
-            msg.append("No kernel module is currently bound to this hardware.")
+            # FIX: Don't show error for System Resources
+            if category in ['Memory Controllers (System)', 'System devices', 'Processors']:
+                msg.append("This device is working properly.")
+                msg.append("No driver is required for this system resource.")
+            else:
+                msg.append("The drivers for this device are not installed. (Code 28)")
+                msg.append("No kernel module is currently bound to this hardware.")
         else:
             msg.append("No driver required.")
 
@@ -258,7 +270,8 @@ class PropertiesDialog(QDialog):
         driver_group.setLayout(driver_layout)
         layout.addWidget(driver_group)
 
-        actions_group = QGroupBox("Actions (Root)")
+        # Admin Actions
+        actions_group = QGroupBox("Actions (Root Required)")
         actions_layout = QVBoxLayout()
 
         btn_unbind = QPushButton(f"Unbind Driver")
@@ -270,9 +283,18 @@ class PropertiesDialog(QDialog):
         btn_unload = QPushButton(f"Unload Module (modprobe -r)")
         btn_unload.clicked.connect(lambda: self.action_unload_module(clean_driver_name))
 
+        is_root = (os.geteuid() == 0)
+
+        # Disable logic
         if not clean_driver_name or clean_driver_name == 'None':
             btn_unbind.setEnabled(False)
             btn_unload.setEnabled(False)
+
+        if not is_root:
+            btn_unbind.setEnabled(False)
+            btn_reprobe.setEnabled(False)
+            btn_unload.setEnabled(False)
+            actions_layout.addWidget(QLabel("<i>Relaunch in Root Mode to use these features.</i>"))
 
         actions_layout.addWidget(btn_unbind)
         actions_layout.addWidget(btn_reprobe)
@@ -318,8 +340,11 @@ class PropertiesDialog(QDialog):
         return widget
 
     def run_root_command(self, cmd_str):
+        if os.geteuid() != 0:
+            QMessageBox.warning(self, "Permission Denied", "You must run LinMan in Root Mode to perform this action.")
+            return
         try:
-            full_cmd = ['pkexec', 'sh', '-c', cmd_str]
+            full_cmd = ['sh', '-c', cmd_str]
             subprocess.check_call(full_cmd)
             QMessageBox.information(self, "Success", "Command executed.")
         except subprocess.CalledProcessError:
@@ -327,11 +352,8 @@ class PropertiesDialog(QDialog):
 
     def action_unbind(self, driver):
         subsystem = self.device_data.get('SUBSYSTEM')
-        if "(via parent)" in self.device_data.get('DRIVER', ''):
-            QMessageBox.information(self, "Info", "This driver belongs to the parent controller.\nUnbinding it will disable all devices connected to that controller.")
-
         path = f"/sys/bus/{subsystem}/drivers/{driver}/unbind"
-        QMessageBox.information(self, "Manual Step", f"To safely unbind this device, run:\necho '{os.path.basename(self.device_data.get('SYS_PATH'))}' | sudo tee {path}")
+        self.run_root_command(f"echo '{os.path.basename(self.device_data.get('SYS_PATH'))}' > {path}")
 
     def action_reprobe(self):
         sys_path = self.device_data.get('SYS_PATH')
@@ -345,8 +367,17 @@ class PropertiesDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LinMan - Device Manager")
-        self.resize(1100, 800)
+
+        self.is_root = (os.geteuid() == 0)
+
+        title = "LinMan - Device Manager"
+        if self.is_root:
+            title += " (Root)"
+            # Signal to other instances that we are alive
+            self.create_handshake_file()
+
+        self.setWindowTitle(title)
+        self.resize(600, 750)
         self.setWindowIcon(QIcon.fromTheme("computer"))
 
         self.context = pyudev.Context()
@@ -358,56 +389,105 @@ class MainWindow(QMainWindow):
         self.setup_monitor()
         QTimer.singleShot(100, self.refresh_devices)
 
+        # If we are User, watch for the Root handshake file
+        if not self.is_root:
+            self.setup_handshake_watcher()
+
+    def create_handshake_file(self):
+        """Creates a temp file to signal the User window that Root has launched."""
+        try:
+            with open(HANDSHAKE_FILE, 'w') as f:
+                f.write(str(os.getpid()))
+        except: pass
+
+    def setup_handshake_watcher(self):
+        """Monitors for the handshake file. If seen, close this window."""
+        self.handshake_timer = QTimer(self)
+        self.handshake_timer.timeout.connect(self.check_handshake)
+        self.handshake_timer.start(500) # Check every 0.5 seconds
+
+    def check_handshake(self):
+        # If the file exists and is recent (less than 10 seconds old)
+        if os.path.exists(HANDSHAKE_FILE):
+            try:
+                if time.time() - os.path.getmtime(HANDSHAKE_FILE) < 10:
+                    # Root instance is confirmed running!
+                    self.close()
+            except: pass
+
     def setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Menu
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-        file_menu.addAction("Exit", self.close)
-
-        view_menu = menubar.addMenu("View")
-        self.action_show_hidden = QAction("Show Hidden Devices", checkable=True)
-        self.action_show_hidden.toggled.connect(self.toggle_hidden_devices)
-        view_menu.addAction(self.action_show_hidden)
-        view_menu.addAction("Refresh", self.refresh_devices)
-
-        help_menu = menubar.addMenu("Help")
-        help_menu.addAction("About", self.show_about)
-
-        # Toolbar
         toolbar = QToolBar()
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-
         scan_action = QAction(self.style().standardIcon(QStyle.SP_BrowserReload), "Scan", self)
         scan_action.triggered.connect(self.refresh_devices)
         toolbar.addAction(scan_action)
 
-        # Tree
+        if not self.is_root:
+            empty = QWidget()
+            empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            toolbar.addWidget(empty)
+            shield_icon = QIcon.fromTheme("security-high")
+            if shield_icon.isNull(): shield_icon = self.style().standardIcon(QStyle.SP_VistaShield)
+
+            self.root_btn = QAction(shield_icon, "Root Mode", self)
+            self.root_btn.triggered.connect(self.restart_as_root)
+            toolbar.addAction(self.root_btn)
+            toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setIndentation(20)
         self.tree.setAnimated(True)
         self.tree.itemDoubleClicked.connect(self.show_properties)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
-
-        font = QFont("Segoe UI", 11)
-        if not font.exactMatch(): font = QFont("Arial", 11)
-        self.tree.setFont(font)
-        self.tree.setIconSize(QSize(20, 20))
-
-        self.tree.setStyleSheet("QTreeWidget::item { padding: 4px; }")
-
+        self.tree.setFont(QFont("Segoe UI", 11))
         layout.addWidget(self.tree)
+
         self.root_item = QTreeWidgetItem(self.tree)
         self.root_item.setText(0, socket.gethostname())
         self.root_item.setIcon(0, self.style().standardIcon(QStyle.SP_ComputerIcon))
         self.root_item.setExpanded(True)
+
+    def restart_as_root(self):
+        msg = "Restart LinMan in Root Mode?\n\nCheck your taskbar for the password prompt."
+        if QMessageBox.question(self, "Root Mode", msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+
+            self.root_btn.setEnabled(False) # Prevent double click
+
+            # 1. PERMISSIONS
+            try:
+                subprocess.call(['xhost', '+SI:localuser:root'])
+            except: pass
+
+            script_path = os.path.abspath(sys.argv[0])
+            current_python_path = os.pathsep.join(sys.path)
+
+            # 2. COMMAND with ENVIRONMENT FORWARDING
+            cmd = [
+                'pkexec',
+                'env',
+                f'DISPLAY={os.environ.get("DISPLAY", ":0")}',
+                f'XAUTHORITY={os.environ.get("XAUTHORITY", "")}',
+                f'PYTHONPATH={current_python_path}',
+                f'XDG_DATA_DIRS={os.environ.get("XDG_DATA_DIRS", "/usr/share:/usr/local/share")}',
+                'QT_QPA_PLATFORM=xcb',
+                sys.executable,
+                script_path
+            ]
+
+            try:
+                # 3. LAUNCH DETACHED
+                subprocess.Popen(cmd, start_new_session=True)
+                # We do NOT close here. We wait for handshake watcher.
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to restart: {e}")
+                self.root_btn.setEnabled(True)
 
     def setup_monitor(self):
         try:
@@ -513,11 +593,8 @@ class MainWindow(QMainWindow):
         # --- 3. Cameras (Webcams) ---
         for device in self.context.list_devices(subsystem='video4linux'):
             if not device.sys_name.startswith('video'): continue
-
-            # Prefer V4L product name (often better than generic USB ID)
             name = device.properties.get('ID_V4L_PRODUCT')
             if not name: name = device.properties.get('ID_MODEL', 'Webcam').replace('_', ' ')
-
             vendor = device.properties.get('ID_VENDOR', 'Generic')
             driver, _ = self.get_driver_recursive(device)
             self.add_entry(unique_devices, device, name, vendor, 'Cameras', 'video4linux', driver)
@@ -530,45 +607,44 @@ class MainWindow(QMainWindow):
                     try:
                         with open(f"{drm_path}/{conn}/status") as f: status = f.read().strip()
                         if status == "connected":
-                            # Use EDID parser
                             real_name = EdidParser.get_monitor_name(f"{drm_path}/{conn}")
                             if not real_name: real_name = f"Generic Monitor ({conn})"
-
                             card_path = os.path.realpath(f"{drm_path}/{conn}")
-                            fake_device = type('obj', (object,), {
-                                'sys_name': conn,
-                                'sys_path': card_path,
-                                'device_path': card_path,
-                                'properties': {}
-                            })
+                            fake_device = type('obj', (object,), {'sys_name': conn, 'sys_path': card_path, 'device_path': card_path, 'properties': {}})
                             self.add_entry(unique_devices, fake_device, real_name, "Standard Monitor Types", "Monitors", "drm", "monitor-driver")
                     except: pass
 
-        # --- 5. Memory (RAM via DMI) ---
-        # Try to read sticks
+        # --- 5. Memory (RAM) ---
+        # Logic: If Root, DmiParser gives us sticks. If User, it gives [].
         ram_modules = DmiParser.get_ram_modules()
-        if ram_modules:
-            for i, mod in enumerate(ram_modules):
-                # Only show sticks that are present
-                if "No Module" in mod.get('Size', ''): continue
 
+        if ram_modules:
+            # We are ROOT and have data
+            for i, mod in enumerate(ram_modules):
+                if "No Module" in mod.get('Size', ''): continue
                 name = f"{mod.get('Size')} {mod.get('Type')} {mod.get('Speed')}"
                 path = f"/sys/devices/system/memory/stick_{i}"
                 fake_mem = type('obj', (object,), {'sys_name': f'ram_{i}', 'sys_path': path, 'device_path': path})
-                self.add_entry(unique_devices, fake_mem, name, mod.get('Manufacturer', 'Unknown'), "Memory", "memory", "ram")
+                self.add_entry(unique_devices, fake_mem, name, mod.get('Manufacturer', 'Unknown'), "Memory (RAM Sticks)", "memory", "ram")
         else:
-            # Fallback to Total System Memory
+            # We are USER (or dmidecode failed), show Fallback Total
             try:
                 with open('/proc/meminfo') as f:
                     total_mem = next((line.split(':')[1].strip() for line in f if "MemTotal" in line), "Unknown")
-                fake_mem = type('obj', (object,), {
-                    'sys_name': 'mem_sys', 'sys_path': '/sys/devices/system/memory', 'device_path': '/sys/devices/system/memory/ram'
-                })
-                self.add_entry(unique_devices, fake_mem, f"System Memory ({total_mem})", "System", "Memory", "memory", "ram")
+                try:
+                    kb = int(total_mem.split()[0])
+                    gb = kb / (1024 * 1024)
+                    mem_str = f"{gb:.1f} GB"
+                except:
+                    mem_str = total_mem
+
+                fake_mem = type('obj', (object,), {'sys_name': 'mem_sys', 'sys_path': '/sys/devices/system/memory', 'device_path': '/sys/devices/system/memory/ram'})
+                label = f"System Memory ({mem_str})"
+                vendor_hint = "System" if self.is_root else "System (Switch to Root for details)"
+                self.add_entry(unique_devices, fake_mem, label, vendor_hint, "Memory (RAM Sticks)", "memory", "ram")
             except: pass
 
         # --- 6. Subsystems ---
-
         for device in self.context.list_devices(subsystem='drm'):
             if device.parent and device.parent.device_path in unique_devices:
                 unique_devices[device.parent.device_path]['category'] = 'Display adapters'
@@ -641,7 +717,6 @@ class MainWindow(QMainWindow):
 
     def handle_child(self, db, device, category, force_new=False, fmt="{}"):
         driver, _ = self.get_driver_recursive(device)
-
         if not force_new:
             curr = device
             found_parent = False
@@ -669,13 +744,15 @@ class MainWindow(QMainWindow):
             except: pass
         if not pci_class: return 'System devices'
         code = pci_class.lower().replace('0x', '').zfill(6)[0:2]
-        return {
+        mapping = {
             '00': 'Other devices', '01': 'Storage controllers', '02': 'Network adapters',
             '03': 'Display adapters', '04': 'Sound, video and game controllers',
-            '05': 'Memory', '06': 'System devices',
+            '05': 'Memory Controllers (System)',
+            '06': 'System devices',
             '07': 'Communication controllers', '08': 'System devices',
             '09': 'Input devices', '0c': 'Universal Serial Bus controllers'
-        }.get(code, 'System devices')
+        }
+        return mapping.get(code, 'System devices')
 
     def add_device_to_tree(self, data):
         cat_name = data['category']
@@ -694,8 +771,11 @@ class MainWindow(QMainWindow):
         if data.get('is_hidden'):
             icon = IconFactory.apply_overlay(icon, 'ghost')
 
+        # --- LOGIC: Handle "Yellow Bang" (!) Icon ---
         if data.get('is_physical') and not data.get('driver'):
-            icon = IconFactory.apply_overlay(icon, 'warning')
+            safe_categories = ['Memory Controllers (System)', 'System devices', 'Processors']
+            if cat_name not in safe_categories:
+                icon = IconFactory.apply_overlay(icon, 'warning')
 
         d_item.setIcon(0, icon)
 
@@ -722,7 +802,8 @@ class MainWindow(QMainWindow):
             'Ports (COM & LPT)': (['modem'], QStyle.SP_ComputerIcon),
             'Cameras': (['camera-web', 'camera-photo'], QStyle.SP_ComputerIcon),
             'Monitors': (['video-display'], QStyle.SP_DesktopIcon),
-            'Memory': (['memory', 'media-flash'], QStyle.SP_DriveCDIcon),
+            'Memory (RAM Sticks)': (['memory', 'media-flash'], QStyle.SP_DriveCDIcon),
+            'Memory Controllers (System)': (['applications-system'], QStyle.SP_ComputerIcon),
         }
         if category in mapping:
             return IconFactory.get(mapping[category][0], mapping[category][1])
@@ -740,7 +821,7 @@ class MainWindow(QMainWindow):
             'Universal Serial Bus controllers': (['drive-removable-media-usb'], QStyle.SP_DriveCDIcon),
             'Cameras': (['camera-web'], QStyle.SP_ComputerIcon),
             'Monitors': (['video-display'], QStyle.SP_DesktopIcon),
-            'Memory': (['memory'], QStyle.SP_DriveCDIcon),
+            'Memory (RAM Sticks)': (['memory'], QStyle.SP_DriveCDIcon),
         }
         if category in mapping:
             return IconFactory.get(mapping[category][0], mapping[category][1])
@@ -755,33 +836,36 @@ class MainWindow(QMainWindow):
 
     def show_context_menu(self, position):
         item = self.tree.itemAt(position)
-        if not item or item.childCount() > 0: return
-
-        # Get data
-        data = item.data(0, Qt.UserRole)
-
         menu = QMenu(self)
 
-        action_props = menu.addAction("Properties")
-        action_props.triggered.connect(lambda: self.show_properties(item, 0))
+        # Show device options if it is a leaf node
+        if item and item.childCount() == 0 and item != self.root_item:
+            data = item.data(0, Qt.UserRole)
+            action_props = menu.addAction("Properties")
+            action_props.triggered.connect(lambda: self.show_properties(item, 0))
 
-        menu.addSeparator()
+            menu.addSeparator()
 
-        action_copy_name = menu.addAction("Copy Name")
-        action_copy_name.triggered.connect(lambda: QApplication.clipboard().setText(item.text(0)))
+            action_copy_name = menu.addAction("Copy Name")
+            action_copy_name.triggered.connect(lambda: QApplication.clipboard().setText(item.text(0)))
 
-        action_copy_path = menu.addAction("Copy Device Path")
-        action_copy_path.triggered.connect(lambda: QApplication.clipboard().setText(data.get('SYS_PATH', '')))
+            if data:
+                action_copy_path = menu.addAction("Copy Device Path")
+                action_copy_path.triggered.connect(lambda: QApplication.clipboard().setText(data.get('SYS_PATH', '')))
 
-        menu.exec(self.tree.mapToGlobal(position))
+        # Show Scan options for whitespace or folders
+        else:
+            action_scan = menu.addAction(self.style().standardIcon(QStyle.SP_BrowserReload), "Scan for hardware changes")
+            action_scan.triggered.connect(self.refresh_devices)
+
+        if not menu.isEmpty():
+            menu.exec(self.tree.mapToGlobal(position))
 
 def main():
     app = QApplication(sys.argv)
-
     # Enable High DPI
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-
-    # Use Fusion as a base because it is the most neutral across Linux distros
+    # Use Fusion style for neutrality
     app.setStyle("Fusion")
 
     window = MainWindow()
