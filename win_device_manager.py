@@ -1,16 +1,17 @@
 """
-LinMan - Linux Device Manager (Compatibility Edition)
-A standalone device manager that relies on system tools rather than external libraries.
+LinMan - Linux Device Manager (Deep Inspection Edition)
+A standalone device manager for hardware diagnostics.
 
 Dependencies:
     pip install PySide6 pyudev
 
 Features:
-- FIX: Deep Parent Search (Fixes USB Audio/Net devices appearing as generic USB)
-- "Show Hidden Devices" toggle (Hides tty/lo/loops by default)
-- Uses system commands (lspci, lsusb) for name resolution
-- No external database downloads required
-- Root Actions (Unbind, Modprobe) via pkexec
+- Monitors: Native EDID parsing (reads /sys/class/drm/.../edid) for real model names
+- RAM: Reads individual sticks via DMI (requires root/pkexec)
+- Webcams: Uses V4L product names
+- Native Look & Feel
+- "Yellow Bang" (!) Icon logic
+- Root Actions via pkexec
 
 """
 
@@ -20,6 +21,7 @@ import os
 import re
 import subprocess
 import shutil
+import struct
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,
                                QMessageBox, QVBoxLayout, QWidget, QDialog, QLabel,
                                QFormLayout, QToolBar, QStyle, QTabWidget, QGroupBox,
@@ -30,6 +32,74 @@ from PySide6.QtCore import Qt, QSize, QSocketNotifier, Slot, QTimer
 from PySide6.QtGui import QIcon, QAction, QFont, QPalette, QColor, QPainter, QPixmap
 
 import pyudev
+
+# --- CONFIGURATION ---
+GITHUB_URL = "https://github.com/your_username/LinMan_Project"
+VERSION = "1.2.0"
+
+# --- Backend: EDID Parser (Monitors) ---
+class EdidParser:
+    @staticmethod
+    def get_monitor_name(sys_path):
+        edid_path = os.path.join(sys_path, "edid")
+        if not os.path.exists(edid_path): return None
+
+        try:
+            with open(edid_path, 'rb') as f:
+                edid = f.read()
+
+            if len(edid) < 128: return None
+
+            # Walk through the 4 descriptors in the EDID block
+            # Descriptors start at byte 54, 72, 90, 108
+            for i in [54, 72, 90, 108]:
+                # Monitor Name tag is 0xFC, header is 00 00 00 FC 00
+                if edid[i:i+4] == b'\x00\x00\x00\xfc':
+                    # Text usually ends with \n (0x0a)
+                    text = edid[i+5:i+18].decode('cp437', 'ignore').split('\x0a')[0]
+                    return text.strip()
+        except: pass
+        return None
+
+# --- Backend: DMI Parser (RAM) ---
+class DmiParser:
+    @staticmethod
+    def get_ram_modules():
+        """Runs dmidecode to get RAM info. Requires Root."""
+        modules = []
+        try:
+            # Try running without pkexec first (in case we are already root)
+            cmd = ['dmidecode', '-t', '17']
+            if os.geteuid() != 0:
+                cmd = ['pkexec'] + cmd
+
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8')
+
+            current_stick = {}
+            for line in output.splitlines():
+                line = line.strip()
+                if "Memory Device" in line:
+                    if current_stick: modules.append(current_stick)
+                    current_stick = {'Name': 'Unknown RAM', 'Size': 'Unknown', 'Type': 'Unknown', 'Speed': 'Unknown'}
+                elif not current_stick:
+                    continue
+
+                if ":" in line:
+                    k, v = [x.strip() for x in line.split(':', 1)]
+                    if k == "Size": current_stick['Size'] = v
+                    elif k == "Type": current_stick['Type'] = v
+                    elif k == "Speed": current_stick['Speed'] = v
+                    elif k == "Manufacturer": current_stick['Manufacturer'] = v
+                    elif k == "Part Number": current_stick['Part'] = v
+                    elif k == "Locator": current_stick['Slot'] = v
+
+            if current_stick: modules.append(current_stick)
+
+        except:
+            # Fallback if user denies root or tool missing
+            pass
+
+        return modules
 
 # --- Backend: Native System Resolver ---
 class SystemResolver:
@@ -66,15 +136,25 @@ class IconFactory:
         return QApplication.style().standardIcon(fallback_style_standard)
 
     @staticmethod
-    def ghost_icon(icon):
-        pixmap = icon.pixmap(32, 32)
-        ghost = QPixmap(pixmap.size())
-        ghost.fill(Qt.transparent)
-        painter = QPainter(ghost)
-        painter.setOpacity(0.5)
-        painter.drawPixmap(0, 0, pixmap)
+    def apply_overlay(base_icon, mode='normal'):
+        pixmap = base_icon.pixmap(32, 32)
+        target = QPixmap(pixmap.size())
+        target.fill(Qt.transparent)
+
+        painter = QPainter(target)
+
+        if mode == 'ghost':
+            painter.setOpacity(0.5)
+            painter.drawPixmap(0, 0, pixmap)
+        else:
+            painter.drawPixmap(0, 0, pixmap)
+
+        if mode == 'warning':
+            warn_icon = QApplication.style().standardIcon(QStyle.SP_MessageBoxWarning).pixmap(16, 16)
+            painter.drawPixmap(16, 16, warn_icon)
+
         painter.end()
-        return QIcon(ghost)
+        return QIcon(target)
 
 # --- UI: Properties Dialog ---
 class PropertiesDialog(QDialog):
@@ -134,16 +214,29 @@ class PropertiesDialog(QDialog):
 
         driver = self.device_data.get('DRIVER')
         is_hidden = self.device_data.get('IS_HIDDEN', False)
+        is_physical = self.device_data.get('IS_PHYSICAL', True)
 
         msg = []
-        if is_hidden: msg.append("This device is hidden/disconnected.")
-        if driver: msg.append(f"This device is working properly.\nDriver: {driver}")
-        else: msg.append("No driver is loaded for this device.")
+
+        if not is_physical:
+             msg.append("This is a Virtual/System device.")
+             if is_hidden: msg.append("It is hidden by default.")
+        elif is_hidden:
+            msg.append("This device is currently disconnected or hidden.")
+
+        if driver:
+            msg.append("This device is working properly.")
+            msg.append(f"Driver loaded: {driver}")
+        elif is_physical and not driver:
+            msg.append("The drivers for this device are not installed. (Code 28)")
+            msg.append("No kernel module is currently bound to this hardware.")
+        else:
+            msg.append("No driver required.")
 
         status_text.setPlainText("\n".join(msg))
         status_text.setReadOnly(True)
-        status_text.setMaximumHeight(80)
-        status_text.setStyleSheet("background-color: #2b2b2b; color: #f0f0f0; border: none;")
+        status_text.setMaximumHeight(100)
+        status_text.setStyleSheet("border: 1px solid palette(mid);")
         status_layout.addWidget(status_text)
         status_group.setLayout(status_layout)
 
@@ -158,6 +251,9 @@ class PropertiesDialog(QDialog):
         driver_group = QGroupBox("Driver")
         driver_layout = QFormLayout()
         driver_name = self.device_data.get('DRIVER', 'None')
+
+        clean_driver_name = driver_name.split(' ')[0] if driver_name else None
+
         driver_layout.addRow("Kernel Module:", QLabel(f"<b>{driver_name}</b>"))
         driver_group.setLayout(driver_layout)
         layout.addWidget(driver_group)
@@ -166,15 +262,17 @@ class PropertiesDialog(QDialog):
         actions_layout = QVBoxLayout()
 
         btn_unbind = QPushButton(f"Unbind Driver")
-        btn_unbind.clicked.connect(self.action_unbind)
-        if not driver_name or driver_name == 'None': btn_unbind.setEnabled(False)
+        btn_unbind.clicked.connect(lambda: self.action_unbind(clean_driver_name))
 
         btn_reprobe = QPushButton("Rescan/Reprobe")
         btn_reprobe.clicked.connect(self.action_reprobe)
 
         btn_unload = QPushButton(f"Unload Module (modprobe -r)")
-        btn_unload.clicked.connect(self.action_unload_module)
-        if not driver_name or driver_name == 'None': btn_unload.setEnabled(False)
+        btn_unload.clicked.connect(lambda: self.action_unload_module(clean_driver_name))
+
+        if not clean_driver_name or clean_driver_name == 'None':
+            btn_unbind.setEnabled(False)
+            btn_unload.setEnabled(False)
 
         actions_layout.addWidget(btn_unbind)
         actions_layout.addWidget(btn_reprobe)
@@ -198,10 +296,10 @@ class PropertiesDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Property:"))
         combo = QComboBox()
-        combo.addItems(["SysFS Path", "Device Path", "Subsystem", "Driver", "Udev Attributes"])
+        combo.addItems(["SysFS Path", "Device Path", "Subsystem", "Driver", "Attributes"])
         val_text = QTextEdit()
         val_text.setReadOnly(True)
-        val_text.setStyleSheet("font-family: Monospace; background-color: #2b2b2b;")
+        val_text.setFont(QFont("Monospace"))
 
         def update_text(idx):
             keys = ['SYS_PATH', 'DEVPATH', 'SUBSYSTEM', 'DRIVER']
@@ -227,20 +325,19 @@ class PropertiesDialog(QDialog):
         except subprocess.CalledProcessError:
             QMessageBox.warning(self, "Error", "Action failed.")
 
-    def action_unbind(self):
-        driver = self.device_data.get('DRIVER')
+    def action_unbind(self, driver):
         subsystem = self.device_data.get('SUBSYSTEM')
-        dev_id = os.path.basename(self.device_data.get('SYS_PATH'))
+        if "(via parent)" in self.device_data.get('DRIVER', ''):
+            QMessageBox.information(self, "Info", "This driver belongs to the parent controller.\nUnbinding it will disable all devices connected to that controller.")
+
         path = f"/sys/bus/{subsystem}/drivers/{driver}/unbind"
-        if QMessageBox.question(self, "Confirm", f"Unbind {dev_id}?") == QMessageBox.Yes:
-            self.run_root_command(f"echo '{dev_id}' > {path}")
+        QMessageBox.information(self, "Manual Step", f"To safely unbind this device, run:\necho '{os.path.basename(self.device_data.get('SYS_PATH'))}' | sudo tee {path}")
 
     def action_reprobe(self):
         sys_path = self.device_data.get('SYS_PATH')
         self.run_root_command(f"echo add > {sys_path}/uevent")
 
-    def action_unload_module(self):
-        mod = self.device_data.get('DRIVER')
+    def action_unload_module(self, mod):
         if QMessageBox.question(self, "Confirm", f"Unload {mod}?") == QMessageBox.Yes:
             self.run_root_command(f"modprobe -r {mod}")
 
@@ -269,16 +366,21 @@ class MainWindow(QMainWindow):
 
         # Menu
         menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        file_menu.addAction("Exit", self.close)
+
         view_menu = menubar.addMenu("View")
         self.action_show_hidden = QAction("Show Hidden Devices", checkable=True)
         self.action_show_hidden.toggled.connect(self.toggle_hidden_devices)
         view_menu.addAction(self.action_show_hidden)
         view_menu.addAction("Refresh", self.refresh_devices)
 
+        help_menu = menubar.addMenu("Help")
+        help_menu.addAction("About", self.show_about)
+
         # Toolbar
         toolbar = QToolBar()
-        toolbar.setStyleSheet("QToolBar { background-color: #2d2d30; border-bottom: 1px solid #3f3f46; padding: 5px; }")
-        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
         scan_action = QAction(self.style().standardIcon(QStyle.SP_BrowserReload), "Scan", self)
@@ -299,15 +401,7 @@ class MainWindow(QMainWindow):
         self.tree.setFont(font)
         self.tree.setIconSize(QSize(20, 20))
 
-        self.tree.setStyleSheet("""
-            QTreeWidget {
-                border: none; background-color: #1e1e1e;
-                color: #e0e0e0; selection-background-color: #0078d4;
-            }
-            QTreeWidget::item { height: 28px; border: none; padding-left: 5px; }
-            QTreeWidget::item:hover:!selected { background-color: #2a2d2e; }
-            QTreeWidget::item:selected { background-color: #0078d4; color: white; }
-        """)
+        self.tree.setStyleSheet("QTreeWidget::item { padding: 4px; }")
 
         layout.addWidget(self.tree)
         self.root_item = QTreeWidgetItem(self.tree)
@@ -336,24 +430,58 @@ class MainWindow(QMainWindow):
         self.show_hidden = checked
         self.refresh_devices()
 
-    def is_device_hidden(self, device, category):
+    def show_about(self):
+        QMessageBox.about(self, "About LinMan",
+            f"<b>LinMan - Linux Device Manager</b><br>"
+            f"Version {VERSION}<br><br>"
+            f"A native Hardware Manager for Linux systems.<br><br>"
+            f"<a href='{GITHUB_URL}'>{GITHUB_URL}</a>")
+
+    def get_device_status_flags(self, device, category):
         name = device.sys_name
+        sys_path = device.sys_path
 
-        # 1. HIDE ALL TTYs by default, EXCEPT USB/ACM
+        is_hidden = False
+        is_physical = True
+
+        if '/virtual/' in sys_path:
+            is_physical = False
+            is_hidden = True
+
         if category == 'Ports (COM & LPT)':
-            if name.startswith(('ttyUSB', 'ttyACM')): return False
-            return True
+            if name.startswith(('ttyUSB', 'ttyACM')): is_hidden = False
+            else: is_hidden = True
 
-        # 2. Hide Loopback/Virtual Net
         if category == 'Network adapters':
-            if name == 'lo': return True
-            if any(x in name for x in ['virbr', 'docker', 'veth', 'tun', 'tap']): return True
+            if name == 'lo': is_hidden = True
+            if any(x in name for x in ['virbr', 'docker', 'veth', 'tun', 'tap', 'tailscale', 'wg']):
+                is_hidden = True
+                is_physical = False
 
-        # 3. Hide Virtual Disks
         if category == 'Disk drives':
-            if name.startswith(('loop', 'ram', 'dm-')): return True
+            if name.startswith(('loop', 'ram', 'dm-')):
+                is_hidden = True
+                is_physical = False
 
-        return False
+        if category == 'Monitors' or category == 'Memory':
+            is_physical = True
+            is_hidden = False
+
+        return is_hidden, is_physical
+
+    def get_driver_recursive(self, device):
+        driver = device.properties.get('DRIVER', '')
+        if driver: return driver, False
+
+        curr = device
+        steps = 0
+        while curr.parent and steps < 4:
+            curr = curr.parent
+            driver = curr.properties.get('DRIVER', '')
+            if driver and driver != 'pcieport':
+                return f"{driver} (via parent)", True
+            steps += 1
+        return '', False
 
     def refresh_devices(self):
         self.root_item.takeChildren()
@@ -362,72 +490,114 @@ class MainWindow(QMainWindow):
 
         # --- 1. Base Hardware (PCI) ---
         for device in self.context.list_devices(subsystem='pci'):
-            # Try to get name from udev DB first (fastest)
             ven = device.properties.get('ID_VENDOR_FROM_DATABASE')
             dev = device.properties.get('ID_MODEL_FROM_DATABASE')
-
-            # If missing, try lspci (most accurate)
             if not ven or not dev:
-                slot_name = device.sys_name # e.g. 0000:00:1f.6
-                l_ven, l_dev = self.resolver.get_pci_name(slot_name)
-                if l_ven: ven = l_ven
-                if l_dev: dev = l_dev
-
-            # Fallback to hex
+                ven, dev = self.resolver.get_pci_name(device.sys_name)
             if not ven: ven = device.properties.get('ID_VENDOR_ID', 'Unknown Vendor')
             if not dev: dev = device.properties.get('ID_MODEL_ID', 'Unknown Device')
 
             cat = self.determine_pci_category(device)
-            self.add_entry(unique_devices, device, dev, ven, cat, 'pci', device.properties.get('DRIVER', ''))
+            driver = device.properties.get('DRIVER', '')
+
+            self.add_entry(unique_devices, device, dev, ven, cat, 'pci', driver)
 
         # --- 2. USB ---
         for device in self.context.list_devices(subsystem='usb'):
             if device.device_type == 'usb_device':
                 ven = device.properties.get('ID_VENDOR_FROM_DATABASE', device.properties.get('ID_VENDOR', 'USB Vendor'))
                 dev = device.properties.get('ID_MODEL_FROM_DATABASE', device.properties.get('ID_MODEL', 'USB Device'))
-                self.add_entry(unique_devices, device, dev, ven, 'Universal Serial Bus controllers', 'usb', device.properties.get('DRIVER', ''))
+                driver, _ = self.get_driver_recursive(device)
+                self.add_entry(unique_devices, device, dev, ven, 'Universal Serial Bus controllers', 'usb', driver)
 
-        # --- 3. Subsystems ---
+        # --- 3. Cameras (Webcams) ---
+        for device in self.context.list_devices(subsystem='video4linux'):
+            if not device.sys_name.startswith('video'): continue
 
-        # Display Adapters (DRM Fix)
+            # Prefer V4L product name (often better than generic USB ID)
+            name = device.properties.get('ID_V4L_PRODUCT')
+            if not name: name = device.properties.get('ID_MODEL', 'Webcam').replace('_', ' ')
+
+            vendor = device.properties.get('ID_VENDOR', 'Generic')
+            driver, _ = self.get_driver_recursive(device)
+            self.add_entry(unique_devices, device, name, vendor, 'Cameras', 'video4linux', driver)
+
+        # --- 4. Monitors (DRM EDID) ---
+        drm_path = "/sys/class/drm"
+        if os.path.exists(drm_path):
+            for conn in os.listdir(drm_path):
+                if "-" in conn and os.path.exists(f"{drm_path}/{conn}/status"):
+                    try:
+                        with open(f"{drm_path}/{conn}/status") as f: status = f.read().strip()
+                        if status == "connected":
+                            # Use EDID parser
+                            real_name = EdidParser.get_monitor_name(f"{drm_path}/{conn}")
+                            if not real_name: real_name = f"Generic Monitor ({conn})"
+
+                            card_path = os.path.realpath(f"{drm_path}/{conn}")
+                            fake_device = type('obj', (object,), {
+                                'sys_name': conn,
+                                'sys_path': card_path,
+                                'device_path': card_path,
+                                'properties': {}
+                            })
+                            self.add_entry(unique_devices, fake_device, real_name, "Standard Monitor Types", "Monitors", "drm", "monitor-driver")
+                    except: pass
+
+        # --- 5. Memory (RAM via DMI) ---
+        # Try to read sticks
+        ram_modules = DmiParser.get_ram_modules()
+        if ram_modules:
+            for i, mod in enumerate(ram_modules):
+                # Only show sticks that are present
+                if "No Module" in mod.get('Size', ''): continue
+
+                name = f"{mod.get('Size')} {mod.get('Type')} {mod.get('Speed')}"
+                path = f"/sys/devices/system/memory/stick_{i}"
+                fake_mem = type('obj', (object,), {'sys_name': f'ram_{i}', 'sys_path': path, 'device_path': path})
+                self.add_entry(unique_devices, fake_mem, name, mod.get('Manufacturer', 'Unknown'), "Memory", "memory", "ram")
+        else:
+            # Fallback to Total System Memory
+            try:
+                with open('/proc/meminfo') as f:
+                    total_mem = next((line.split(':')[1].strip() for line in f if "MemTotal" in line), "Unknown")
+                fake_mem = type('obj', (object,), {
+                    'sys_name': 'mem_sys', 'sys_path': '/sys/devices/system/memory', 'device_path': '/sys/devices/system/memory/ram'
+                })
+                self.add_entry(unique_devices, fake_mem, f"System Memory ({total_mem})", "System", "Memory", "memory", "ram")
+            except: pass
+
+        # --- 6. Subsystems ---
+
         for device in self.context.list_devices(subsystem='drm'):
-            parent = device.parent
-            if parent and parent.device_path in unique_devices:
-                unique_devices[parent.device_path]['category'] = 'Display adapters'
+            if device.parent and device.parent.device_path in unique_devices:
+                unique_devices[device.parent.device_path]['category'] = 'Display adapters'
 
-        # Network
         for device in self.context.list_devices(subsystem='net'):
             self.handle_child(unique_devices, device, 'Network adapters')
 
-        # Sound - RECURSIVE PARENT SEARCH FIX for USB Headsets
         for device in self.context.list_devices(subsystem='sound'):
             if 'card' in device.sys_name:
                 curr = device
-                # Walk up tree to find physical parent (fixes USB Interface issue)
                 while curr.parent:
                     curr = curr.parent
                     if curr.device_path in unique_devices:
                         unique_devices[curr.device_path]['category'] = 'Sound, video and game controllers'
                         break
 
-        # Disk
         for device in self.context.list_devices(subsystem='block'):
             if device.device_type == 'disk':
                 self.handle_child(unique_devices, device, 'Disk drives', force_new=True)
 
-        # Bluetooth
         for device in self.context.list_devices(subsystem='bluetooth'):
             if 'hci' in device.sys_name:
-                parent = device.parent
-                if parent and parent.device_path in unique_devices:
-                    unique_devices[parent.device_path]['category'] = 'Bluetooth'
-                    unique_devices[parent.device_path]['name'] = 'Bluetooth Adapter'
+                if device.parent and device.parent.device_path in unique_devices:
+                    unique_devices[device.parent.device_path]['category'] = 'Bluetooth'
+                    unique_devices[device.parent.device_path]['name'] = 'Bluetooth Adapter'
 
-        # TTY (COM Ports)
         for device in self.context.list_devices(subsystem='tty'):
              self.handle_child(unique_devices, device, 'Ports (COM & LPT)', force_new=True, fmt="Communications Port ({})")
 
-        # Input
         for device in self.context.list_devices(subsystem='input'):
             if device.sys_name.startswith('input'):
                 props = device.properties
@@ -436,9 +606,9 @@ class MainWindow(QMainWindow):
                 elif props.get('ID_INPUT_MOUSE') == '1': cat = 'Mice and other pointing devices'
                 if cat:
                     name = props.get('NAME', 'Input Device').strip('"')
-                    self.add_entry(unique_devices, device, name, '', cat, 'input', '')
+                    driver, _ = self.get_driver_recursive(device)
+                    self.add_entry(unique_devices, device, name, '', cat, 'input', driver)
 
-        # Batteries
         for device in self.context.list_devices(subsystem='power_supply'):
             if device.properties.get('POWER_SUPPLY_TYPE') == 'Battery':
                 self.add_entry(unique_devices, device, f"Battery ({device.sys_name})", '', 'Batteries', 'power', 'battery')
@@ -449,10 +619,8 @@ class MainWindow(QMainWindow):
                 model = next((line.split(':')[1].strip() for line in f if "model name" in line), "Processor")
             for i in range(os.cpu_count() or 1):
                 path = f"/sys/devices/system/cpu/cpu{i}"
-                unique_devices[path] = {
-                    'name': model, 'vendor': 'Intel/AMD', 'category': 'Processors',
-                    'sys_path': path, 'subsystem': 'cpu', 'driver': 'processor', 'is_hidden': False
-                }
+                fake_dev = type('obj', (object,), {'sys_name': f'cpu{i}', 'sys_path': path, 'device_path': path})
+                self.add_entry(unique_devices, fake_dev, model, 'Intel/AMD', 'Processors', 'cpu', 'processor')
         except: pass
 
         # --- Render ---
@@ -461,25 +629,28 @@ class MainWindow(QMainWindow):
             self.add_device_to_tree(data)
         self.root_item.setExpanded(True)
 
-    def add_entry(self, db, device, name, vendor, cat, sub, driver, is_hidden=False):
+    def add_entry(self, db, device, name, vendor, cat, sub, driver):
+        is_hidden, is_physical = self.get_device_status_flags(device, cat)
+
         db[device.device_path] = {
             'name': name, 'vendor': vendor, 'category': cat,
             'sys_path': device.sys_path, 'subsystem': sub,
-            'driver': driver, 'is_hidden': is_hidden, 'devpath': device.device_path
+            'driver': driver, 'is_hidden': is_hidden, 'is_physical': is_physical,
+            'devpath': device.device_path
         }
 
     def handle_child(self, db, device, category, force_new=False, fmt="{}"):
-        hidden = self.is_device_hidden(device, category)
+        driver, _ = self.get_driver_recursive(device)
+
         if not force_new:
-            # Recursive check up to 3 levels to find physical parent
             curr = device
             found_parent = False
             for _ in range(3):
                 parent = curr.parent
                 if parent and parent.device_path in db:
                     db[parent.device_path]['category'] = category
-                    if not db[parent.device_path]['driver']:
-                        db[parent.device_path]['driver'] = device.properties.get('DRIVER', '')
+                    if not db[parent.device_path]['driver'] and driver:
+                        db[parent.device_path]['driver'] = driver
                     found_parent = True
                     break
                 if parent: curr = parent
@@ -488,7 +659,7 @@ class MainWindow(QMainWindow):
 
         name = device.properties.get('ID_MODEL', device.sys_name).replace('_', ' ')
         if fmt != "{}": name = fmt.format(device.sys_name)
-        self.add_entry(db, device, name, device.properties.get('ID_VENDOR', ''), category, device.subsystem, device.properties.get('DRIVER', ''), hidden)
+        self.add_entry(db, device, name, device.properties.get('ID_VENDOR', ''), category, device.subsystem, driver)
 
     def determine_pci_category(self, device):
         pci_class = device.properties.get('PCI_CLASS')
@@ -501,7 +672,7 @@ class MainWindow(QMainWindow):
         return {
             '00': 'Other devices', '01': 'Storage controllers', '02': 'Network adapters',
             '03': 'Display adapters', '04': 'Sound, video and game controllers',
-            '05': 'Memory technology devices', '06': 'System devices',
+            '05': 'Memory', '06': 'System devices',
             '07': 'Communication controllers', '08': 'System devices',
             '09': 'Input devices', '0c': 'Universal Serial Bus controllers'
         }.get(code, 'System devices')
@@ -518,16 +689,21 @@ class MainWindow(QMainWindow):
         name = re.sub(' +', ' ', f"{data['vendor']} {data['name']}".strip())
         d_item.setText(0, name)
 
-        # Smart Icon Selection
         icon = self.get_device_icon(cat_name)
-        if data.get('is_hidden'): icon = IconFactory.ghost_icon(icon)
+
+        if data.get('is_hidden'):
+            icon = IconFactory.apply_overlay(icon, 'ghost')
+
+        if data.get('is_physical') and not data.get('driver'):
+            icon = IconFactory.apply_overlay(icon, 'warning')
+
         d_item.setIcon(0, icon)
 
         prop_data = {
             'MODEL': data['name'], 'VENDOR': data['vendor'], 'CATEGORY': cat_name,
             'SYS_PATH': data.get('sys_path'), 'SUBSYSTEM': data.get('subsystem'),
             'DRIVER': data.get('driver'), 'DEVPATH': data.get('devpath'),
-            'IS_HIDDEN': data.get('is_hidden')
+            'IS_HIDDEN': data.get('is_hidden'), 'IS_PHYSICAL': data.get('is_physical')
         }
         d_item.setData(0, Qt.UserRole, prop_data)
 
@@ -544,6 +720,9 @@ class MainWindow(QMainWindow):
             'Bluetooth': (['bluetooth', 'network-wireless'], QStyle.SP_ComputerIcon),
             'Batteries': (['battery'], QStyle.SP_TitleBarNormalButton),
             'Ports (COM & LPT)': (['modem'], QStyle.SP_ComputerIcon),
+            'Cameras': (['camera-web', 'camera-photo'], QStyle.SP_ComputerIcon),
+            'Monitors': (['video-display'], QStyle.SP_DesktopIcon),
+            'Memory': (['memory', 'media-flash'], QStyle.SP_DriveCDIcon),
         }
         if category in mapping:
             return IconFactory.get(mapping[category][0], mapping[category][1])
@@ -559,6 +738,9 @@ class MainWindow(QMainWindow):
             'Bluetooth': (['bluetooth'], QStyle.SP_ComputerIcon),
             'Disk drives': (['drive-harddisk'], QStyle.SP_DriveHDIcon),
             'Universal Serial Bus controllers': (['drive-removable-media-usb'], QStyle.SP_DriveCDIcon),
+            'Cameras': (['camera-web'], QStyle.SP_ComputerIcon),
+            'Monitors': (['video-display'], QStyle.SP_DesktopIcon),
+            'Memory': (['memory'], QStyle.SP_DriveCDIcon),
         }
         if category in mapping:
             return IconFactory.get(mapping[category][0], mapping[category][1])
@@ -574,46 +756,33 @@ class MainWindow(QMainWindow):
     def show_context_menu(self, position):
         item = self.tree.itemAt(position)
         if not item or item.childCount() > 0: return
+
+        # Get data
+        data = item.data(0, Qt.UserRole)
+
         menu = QMenu(self)
-        menu.addAction("Properties", lambda: self.show_properties(item, 0))
+
+        action_props = menu.addAction("Properties")
+        action_props.triggered.connect(lambda: self.show_properties(item, 0))
+
+        menu.addSeparator()
+
+        action_copy_name = menu.addAction("Copy Name")
+        action_copy_name.triggered.connect(lambda: QApplication.clipboard().setText(item.text(0)))
+
+        action_copy_path = menu.addAction("Copy Device Path")
+        action_copy_path.triggered.connect(lambda: QApplication.clipboard().setText(data.get('SYS_PATH', '')))
+
         menu.exec(self.tree.mapToGlobal(position))
 
 def main():
     app = QApplication(sys.argv)
 
-    # Dark Theme
-    palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(32, 32, 32))
-    palette.setColor(QPalette.WindowText, QColor(240, 240, 240))
-    palette.setColor(QPalette.Base, QColor(25, 25, 25))
-    palette.setColor(QPalette.AlternateBase, QColor(32, 32, 32))
-    palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
-    palette.setColor(QPalette.ToolTipText, QColor(255, 255, 255))
-    palette.setColor(QPalette.Text, QColor(240, 240, 240))
-    palette.setColor(QPalette.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ButtonText, QColor(240, 240, 240))
-    palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
-    palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.Highlight, QColor(0, 120, 215))
-    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    app.setPalette(palette)
-    app.setStyle("Fusion")
+    # Enable High DPI
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
-    app.setStyleSheet("""
-        QMainWindow { background-color: #202020; }
-        QMenu { background-color: #2b2b2b; border: 1px solid #353535; color: #f0f0f0; }
-        QMenu::item:selected { background-color: #0078d4; }
-        QDialog { background-color: #202020; }
-        QGroupBox { border: 1px solid #353535; margin-top: 10px; border-radius: 4px; padding-top: 15px; color: #f0f0f0; }
-        QLabel { color: #f0f0f0; }
-        QPushButton { background-color: #353535; border: 1px solid #454545; color: #f0f0f0; padding: 6px; border-radius: 4px; }
-        QPushButton:hover { background-color: #454545; border-color: #0078d4; }
-        QPushButton:disabled { color: #666; }
-        QTabWidget::pane { border: 1px solid #353535; background: #202020; }
-        QTabBar::tab { background: #2b2b2b; color: #f0f0f0; padding: 8px 16px; border: 1px solid #353535; }
-        QTabBar::tab:selected { background: #353535; }
-        QHeaderView::section { background-color: #2b2b2b; color: #f0f0f0; padding: 4px; border: 1px solid #353535; }
-    """)
+    # Use Fusion as a base because it is the most neutral across Linux distros
+    app.setStyle("Fusion")
 
     window = MainWindow()
     window.show()
