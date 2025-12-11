@@ -34,7 +34,7 @@ from PySide6.QtGui import QIcon, QAction, QFont, QPalette, QColor, QPainter, QPi
 import pyudev
 
 # --- CONFIGURATION ---
-GITHUB_URL = "https://github.com/your_username/LinMan_Project"
+GITHUB_URL = "https://github.com/lolren/LinMan-Linux-Device-Manager"
 VERSION = "1.2.0"
 
 # --- Backend: EDID Parser (Monitors) ---
