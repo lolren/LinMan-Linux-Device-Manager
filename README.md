@@ -13,6 +13,23 @@ A native, standalone device manager for Linux systems that provides a Windows De
 - **Device Properties**: View detailed information about each device
 - **Driver Management**: Unbind drivers, rescan hardware, unload modules (Root only)
 
+## Screenshots
+
+### Main Window - User Mode
+![Main Window - User Mode](Screenshot1.png)
+
+The main interface showing all detected hardware organized by category. Devices are displayed in a tree structure similar to Windows Device Manager.
+
+### Device Properties Dialog
+![Device Properties](Screenshot2.png)
+
+Double-click any device to view detailed properties including device type, manufacturer, driver information, and device status. Shows three tabs: General, Driver, and Details.
+
+### Root Mode
+![Root Mode](Screenshot3.png)
+
+Switch to Root Mode for advanced features like driver management, unbinding drivers, rescanning hardware, and viewing detailed RAM stick information using dmidecode.
+
 ## Requirements
 
 - Linux operating system
